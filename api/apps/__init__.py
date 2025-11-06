@@ -18,8 +18,9 @@ import sys
 import logging
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
-from flask import Blueprint, Flask
+from flask import Blueprint, Flask, request, jsonify
 from werkzeug.wrappers.request import Request
+from werkzeug.exceptions import NotFound
 from flask_cors import CORS
 from flasgger import Swagger
 from itsdangerous.url_safe import URLSafeTimedSerializer as Serializer
@@ -34,7 +35,8 @@ from flask_mail import Mail
 from flask_session import Session
 from flask_login import LoginManager
 from common import settings
-from api.utils.api_utils import server_error_response
+from api.utils.api_utils import server_error_response, get_json_result
+from common.constants import RetCode
 from api.constants import API_VERSION
 
 __all__ = ["app"]
@@ -42,6 +44,17 @@ __all__ = ["app"]
 Request.json = property(lambda self: self.get_json(force=True, silent=True))
 
 app = Flask(__name__)
+
+
+# 延迟导入RuntimeConfig以避免循环导入
+def is_debug_mode():
+    """检查是否处于DEBUG模式"""
+    try:
+        from api.db.runtime_config import RuntimeConfig
+        return RuntimeConfig.DEBUG if RuntimeConfig.DEBUG is not None else False
+    except (ImportError, AttributeError):
+        # 如果RuntimeConfig未初始化，通过app.config检查
+        return app.config.get('DEBUG', False)
 smtp_mail_server = Mail()
 
 # Add this at the beginning of your file to configure Swagger UI
@@ -80,6 +93,77 @@ CORS(app, supports_credentials=True, max_age=2592000)
 app.url_map.strict_slashes = False
 app.json_encoder = CustomJSONEncoder
 app.errorhandler(Exception)(server_error_response)
+
+
+def handle_404_error(e):
+    """处理404错误，记录详细的请求信息用于调试"""
+    # 记录请求的详细信息
+    request_info = {
+        "method": request.method,
+        "url": request.url,
+        "path": request.path,
+        "query_string": request.query_string.decode('utf-8') if request.query_string else None,
+        "remote_addr": request.remote_addr,
+        "headers": dict(request.headers),
+        "content_type": request.content_type,
+        "content_length": request.content_length,
+    }
+    
+    # 记录请求体（如果有且不是太大的话）
+    try:
+        if request.content_length and request.content_length < 1024:  # 只记录小于1KB的请求体
+            if request.is_json:
+                request_info["json_body"] = request.get_json(silent=True)
+            elif request.form:
+                request_info["form_data"] = dict(request.form)
+    except Exception as ex:
+        logging.warning(f"Failed to capture request body: {ex}")
+    
+    # 获取已注册的路由列表（用于分析）
+    registered_routes = []
+    try:
+        for rule in app.url_map.iter_rules():
+            registered_routes.append({
+                "rule": rule.rule,
+                "methods": sorted(rule.methods),
+                "endpoint": rule.endpoint
+            })
+    except Exception as ex:
+        logging.warning(f"Failed to get registered routes: {ex}")
+    
+    # 查找相似的路由（用于提示）
+    similar_routes = []
+    if request.path:
+        for rule in app.url_map.iter_rules():
+            # 简单的相似度检查：检查路径前缀或相似部分
+            if request.path.startswith(rule.rule.split('<')[0]) or rule.rule.startswith(request.path.split('/')[0]):
+                if rule.rule not in [r["rule"] for r in similar_routes]:
+                    similar_routes.append({
+                        "rule": rule.rule,
+                        "methods": sorted(rule.methods),
+                        "endpoint": rule.endpoint
+                    })
+    
+    # 记录详细的404错误信息
+    logging.error(
+        f"404 Not Found - Request details: {request_info}, "
+        f"Similar routes: {similar_routes[:5] if similar_routes else 'None'}"
+    )
+    
+    # 如果启用了DEBUG模式，记录所有注册的路由
+    if is_debug_mode():
+        logging.debug(f"All registered routes ({len(registered_routes)}): {registered_routes}")
+    
+    # 返回标准的JSON错误响应
+    return get_json_result(
+        code=RetCode.EXCEPTION_ERROR,
+        message=f"The requested URL was not found on the server. Path: {request.path}, Method: {request.method}"
+    ), 404
+
+
+# 注册404错误处理器
+app.errorhandler(404)(handle_404_error)
+app.errorhandler(NotFound)(handle_404_error)
 
 ## convince for dev and debug
 # app.config["LOGIN_DISABLED"] = True
@@ -128,6 +212,11 @@ def register_page(page_path):
     )
 
     app.register_blueprint(page.manager, url_prefix=url_prefix)
+    
+    # 记录注册的路由信息
+    registered_routes_count = len(list(app.url_map.iter_rules()))
+    logging.debug(f"Registered blueprint '{page_name}' with prefix '{url_prefix}', total routes: {registered_routes_count}")
+    
     return url_prefix
 
 
@@ -140,6 +229,43 @@ pages_dir = [
 client_urls_prefix = [
     register_page(path) for dir in pages_dir for path in search_pages_path(dir)
 ]
+
+# 记录所有注册的路由摘要（仅在启动时记录一次）
+def log_registered_routes():
+    """记录所有已注册的路由，用于调试"""
+    routes_by_prefix = {}
+    for rule in app.url_map.iter_rules():
+        prefix = rule.rule.split('/')[1] if len(rule.rule.split('/')) > 1 else ''
+        if prefix not in routes_by_prefix:
+            routes_by_prefix[prefix] = []
+        routes_by_prefix[prefix].append({
+            "rule": rule.rule,
+            "methods": sorted(rule.methods),
+            "endpoint": rule.endpoint
+        })
+    
+    logging.info(f"Total registered routes: {len(list(app.url_map.iter_rules()))}")
+    if is_debug_mode():
+        logging.debug("Registered routes by prefix:")
+        for prefix, routes in sorted(routes_by_prefix.items()):
+            logging.debug(f"  Prefix '{prefix}': {len(routes)} routes")
+            for route in routes[:3]:  # 只显示前3个
+                logging.debug(f"    {route['methods']} {route['rule']}")
+            if len(routes) > 3:
+                logging.debug(f"    ... and {len(routes) - 3} more routes")
+
+
+# 在路由注册完成后调用，记录所有注册的路由
+def log_routes_after_registration():
+    """在路由注册完成后调用，记录所有注册的路由"""
+    try:
+        log_registered_routes()
+    except Exception as e:
+        logging.warning(f"Failed to log registered routes: {e}")
+
+
+# 在路由注册完成后调用
+log_routes_after_registration()
 
 
 @login_manager.request_loader
@@ -179,3 +305,41 @@ def load_user(web_request):
 @app.teardown_request
 def _db_close(exc):
     close_connection()
+
+
+@app.before_request
+def log_request_info():
+    """记录请求信息，用于调试和问题排查"""
+    # 记录请求的基本信息
+    request_log = {
+        "method": request.method,
+        "path": request.path,
+        "remote_addr": request.remote_addr,
+    }
+    
+    # 在DEBUG模式下记录更详细的信息
+    if is_debug_mode():
+        request_log.update({
+            "url": request.url,
+            "query_string": request.query_string.decode('utf-8') if request.query_string else None,
+            "content_type": request.content_type,
+            "content_length": request.content_length,
+            "user_agent": request.headers.get('User-Agent'),
+        })
+        logging.debug(f"Incoming request: {request_log}")
+    else:
+        # 非DEBUG模式下只记录关键信息
+        logging.info(f"Request: {request.method} {request.path} from {request.remote_addr}")
+
+
+@app.after_request
+def log_response_info(response):
+    """记录响应信息，用于调试"""
+    if is_debug_mode():
+        logging.debug(
+            f"Response: {request.method} {request.path} - "
+            f"Status: {response.status_code}, "
+            f"Content-Type: {response.content_type}, "
+            f"Content-Length: {response.content_length}"
+        )
+    return response

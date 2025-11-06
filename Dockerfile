@@ -4,7 +4,7 @@ USER root
 SHELL ["/bin/bash", "-c"]
 
 ARG NEED_MIRROR=0
-
+  
 WORKDIR /ragflow
 
 # Copy models downloaded via download_deps.py
@@ -19,9 +19,9 @@ RUN --mount=type=bind,from=infiniflow/ragflow_deps:latest,source=/huggingface.co
 # https://github.com/chrismattmann/tika-python
 # This is the only way to run python-tika without internet access. Without this set, the default is to check the tika version and pull latest every time from Apache.
 RUN --mount=type=bind,from=infiniflow/ragflow_deps:latest,source=/,target=/deps \
-    cp -r /deps/nltk_data /root/ && \
+    cp -r /deps/nltk_data /root/ && \ 
     cp /deps/tika-server-standard-3.0.0.jar /deps/tika-server-standard-3.0.0.jar.md5 /ragflow/ && \
-    cp /deps/cl100k_base.tiktoken /ragflow/9b5ad71b2ce5302211f9c61530b329a4922fc6a4
+    cp /deps/cl100k_base.tiktoken /ragflow/9b5ad71b2ce5302211f9c61530b329a4922fc6a4        
 
 ENV TIKA_SERVER_JAR="file:///ragflow/tika-server-standard-3.0.0.jar"
 ENV DEBIAN_FRONTEND=noninteractive
