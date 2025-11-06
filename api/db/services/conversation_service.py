@@ -147,12 +147,34 @@ def completion(tenant_id, chat_id, question, name="New session", session_id=None
     conv.reference.append({"chunks": [], "doc_aggs": []})
 
     if stream:
+        import logging
+        import time
+        first_answer_time = None
+        answer_count = 0
+        
         try:
             for ans in chat(dia, msg, True, **kwargs):
+                if first_answer_time is None:
+                    first_answer_time = time.time()
+                    logging.info(
+                        f"[RAGFlow] First answer generated in completion() - session_id: {session_id}, "
+                        f"chat_id: {chat_id}"
+                    )
+                
+                answer_count += 1
                 ans = structure_answer(conv, ans, message_id, session_id)
                 yield "data:" + json.dumps({"code": 0, "data": ans}, ensure_ascii=False) + "\n\n"
             ConversationService.update_by_id(conv.id, conv.to_dict())
+            logging.info(
+                f"[RAGFlow] Completion answer generation finished - session_id: {session_id}, "
+                f"chat_id: {chat_id}, total_answers: {answer_count}"
+            )
         except Exception as e:
+            logging.error(
+                f"[RAGFlow] Completion answer generation ERROR - session_id: {session_id}, "
+                f"chat_id: {chat_id}, error: {str(e)}",
+                exc_info=True
+            )
             yield "data:" + json.dumps({"code": 500, "message": str(e),
                                         "data": {"answer": "**ERROR**: " + str(e), "reference": []}},
                                        ensure_ascii=False) + "\n\n"

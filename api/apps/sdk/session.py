@@ -14,6 +14,7 @@
 #  limitations under the License.
 #
 import json
+import logging
 import re
 import time
 
@@ -130,20 +131,108 @@ def chat_completion(tenant_id, chat_id):
     if req.get("session_id"):
         if not ConversationService.query(id=req["session_id"], dialog_id=chat_id):
             return get_error_data_result(f"You don't own the session {req['session_id']}")
+    
+    # 记录请求开始
+    start_time = time.time()
+    session_id = req.get("session_id", "new")
+    question_preview = (req.get("question", "") or "")[:50]
+    client_ip = request.remote_addr
+    logging.info(
+        f"[RAGFlow] Completion request START - chat_id: {chat_id}, session_id: {session_id}, "
+        f"question: {question_preview}..., client_ip: {client_ip}, stream: {req.get('stream', True)}"
+    )
+    
     if req.get("stream", True):
-        resp = Response(rag_completion(tenant_id, chat_id, **req), mimetype="text/event-stream")
+        def streaming_wrapper():
+            first_chunk_sent = False
+            first_chunk_time = None
+            chunk_count = 0
+            last_chunk_time = None
+            
+            try:
+                # 立即发送一个保活chunk，确保连接建立
+                # 这可以帮助客户端知道服务器已收到请求并开始处理
+                keepalive_chunk = "data:" + json.dumps({"code": 0, "message": "", "data": {"status": "processing"}}, ensure_ascii=False) + "\n\n"
+                yield keepalive_chunk
+                keepalive_sent_time = time.time()
+                keepalive_elapsed = keepalive_sent_time - start_time
+                logging.info(
+                    f"[RAGFlow] Keepalive chunk SENT - chat_id: {chat_id}, session_id: {session_id}, "
+                    f"elapsed: {keepalive_elapsed:.3f}s"
+                )
+                
+                # 开始流式响应
+                for chunk in rag_completion(tenant_id, chat_id, **req):
+                    if not first_chunk_sent:
+                        first_chunk_time = time.time()
+                        first_chunk_elapsed = first_chunk_time - start_time
+                        first_chunk_sent = True
+                        logging.info(
+                            f"[RAGFlow] First data chunk SENT - chat_id: {chat_id}, session_id: {session_id}, "
+                            f"elapsed: {first_chunk_elapsed:.3f}s"
+                        )
+                    
+                    chunk_count += 1
+                    last_chunk_time = time.time()
+                    yield chunk
+                
+                # 流式响应完成
+                total_elapsed = time.time() - start_time
+                if first_chunk_time:
+                    streaming_duration = last_chunk_time - first_chunk_time if last_chunk_time else 0
+                    logging.info(
+                        f"[RAGFlow] Completion streaming COMPLETED - chat_id: {chat_id}, session_id: {session_id}, "
+                        f"total_chunks: {chunk_count}, first_chunk_elapsed: {first_chunk_elapsed:.3f}s, "
+                        f"streaming_duration: {streaming_duration:.3f}s, total_elapsed: {total_elapsed:.3f}s"
+                    )
+                else:
+                    logging.warning(
+                        f"[RAGFlow] Completion streaming completed with NO DATA CHUNKS - chat_id: {chat_id}, "
+                        f"session_id: {session_id}, total_elapsed: {total_elapsed:.3f}s"
+                    )
+                    
+            except Exception as e:
+                error_elapsed = time.time() - start_time
+                logging.error(
+                    f"[RAGFlow] Completion streaming ERROR - chat_id: {chat_id}, session_id: {session_id}, "
+                    f"error: {str(e)}, elapsed: {error_elapsed:.3f}s",
+                    exc_info=True
+                )
+                raise
+        
+        resp = Response(streaming_wrapper(), mimetype="text/event-stream")
         resp.headers.add_header("Cache-control", "no-cache")
         resp.headers.add_header("Connection", "keep-alive")
         resp.headers.add_header("X-Accel-Buffering", "no")
         resp.headers.add_header("Content-Type", "text/event-stream; charset=utf-8")
-
+        # 添加额外的响应头，确保不缓冲
+        resp.headers.add_header("X-Content-Type-Options", "nosniff")
+        
+        logging.info(
+            f"[RAGFlow] Response object created - chat_id: {chat_id}, session_id: {session_id}, "
+            f"headers configured"
+        )
         return resp
     else:
-        answer = None
-        for ans in rag_completion(tenant_id, chat_id, **req):
-            answer = ans
-            break
-        return get_result(data=answer)
+        try:
+            answer = None
+            for ans in rag_completion(tenant_id, chat_id, **req):
+                answer = ans
+                break
+            total_elapsed = time.time() - start_time
+            logging.info(
+                f"[RAGFlow] Completion non-streaming COMPLETED - chat_id: {chat_id}, session_id: {session_id}, "
+                f"elapsed: {total_elapsed:.3f}s"
+            )
+            return get_result(data=answer)
+        except Exception as e:
+            error_elapsed = time.time() - start_time
+            logging.error(
+                f"[RAGFlow] Completion non-streaming ERROR - chat_id: {chat_id}, session_id: {session_id}, "
+                f"error: {str(e)}, elapsed: {error_elapsed:.3f}s",
+                exc_info=True
+            )
+            raise
 
 
 @manager.route("/chats_openai/<chat_id>/chat/completions", methods=["POST"])  # noqa: F821
